@@ -1,0 +1,232 @@
+name: temporary-todo-readme-sync
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply changes and push the README update
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  todo-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Generate and verify TODO README
+        id: sync
+        env:
+          APPLY: ${{ github.event.inputs.apply }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev
+          python3 - <<'PY'
+          import difflib
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          readme_path = Path("README.md")
+          orig = readme_path.read_text(encoding="utf-8")
+
+          def run_git(args, check=True):
+              p = subprocess.run(
+                  ["git"] + args,
+                  text=True,
+                  encoding="utf-8",
+                  capture_output=True,
+              )
+              if check and p.returncode != 0:
+                  print(p.stdout)
+                  print(p.stderr, file=sys.stderr)
+                  raise SystemExit(f"git command failed: {' '.join(args)}")
+              return p
+
+          def git_lines(args):
+              return run_git(args).stdout.splitlines()
+
+          def extract_entries(ref, path):
+              p = run_git(["show", f"{ref}:{path}"], check=False)
+              if p.returncode != 0:
+                  return None
+              entries = []
+              for line_no, line in enumerate(p.stdout.splitlines(), start=1):
+                  pos = line.find("TODO")
+                  if pos == -1:
+                      continue
+                  message = line[pos + 4:].strip()
+                  if message.startswith(":"):
+                      message = message[1:].lstrip()
+                  entries.append(f"- [ ] **{path}:{line_no}** - {message}")
+              return entries
+
+          py_paths = sorted(
+              x for x in git_lines(["ls-tree", "-r", "--name-only", "origin/dev"])
+              if x.endswith(".py")
+          )
+          dev_blocks = {}
+          for path in py_paths:
+              entries = extract_entries("origin/dev", path)
+              if entries:
+                  dev_blocks[path] = entries
+
+          changed_py = sorted(
+              x for x in git_lines(["diff", "--name-only", "origin/main", "origin/dev"])
+              if x.endswith(".py")
+          )
+
+          print(f"Python files on dev: {len(py_paths)}")
+          print(f"TODO entries extracted from all dev Python files: {sum(len(v) for v in dev_blocks.values())}")
+          print(f"Changed Python files main..dev: {changed_py}")
+
+          lines = orig.splitlines()
+          title_indices = [
+              i for i, line in enumerate(lines)
+              if line.startswith("### ") and "Complete TODO List" in line
+          ]
+          assert len(title_indices) == 1, f"expected one TODO title, got {title_indices}"
+          title_idx = title_indices[0]
+          assert lines[title_idx] == "### 📝 Complete TODO List", repr(lines[title_idx])
+
+          end_idx = next(
+              i for i in range(title_idx + 1, len(lines))
+              if lines[i].startswith("## ")
+          )
+
+          entry_re = re.compile(
+              r"^- \[ \] \*\*(?P<path>.+?):(?P<line>[0-9]+)\*\* - (?P<message>.*)$"
+          )
+          groups = {}
+          order = []
+          baseline_count = 0
+
+          for i in range(title_idx + 1, end_idx):
+              raw = lines[i]
+              if not raw.strip():
+                  continue
+              m = entry_re.match(raw)
+              assert m, f"bad README entry on line {i + 1}: {raw!r}"
+              path = m.group("path")
+              assert int(m.group("line")) > 0
+              if path not in groups:
+                  groups[path] = []
+                  order.append(path)
+              groups[path].append(raw)
+              baseline_count += 1
+
+          print(f"Baseline README entries: {baseline_count} across {len(groups)} paths")
+          if order != sorted(order):
+              print("WARNING: baseline path order differs from lexical order")
+              for old, new in zip(order, sorted(order)):
+                  if old != new:
+                      print("first order difference:", repr(old), repr(new))
+                      break
+
+          validation_errors = []
+          for path in changed_py:
+              main_entries = extract_entries("origin/main", path)
+              baseline_block = groups.get(path)
+              if main_entries is not None and baseline_block is not None:
+                  if main_entries != baseline_block:
+                      validation_errors.append(path)
+                      print(f"\nMAIN EXTRACTION MISMATCH: {path}")
+                      print(
+                          f"generated={len(main_entries)} "
+                          f"baseline={len(baseline_block)}"
+                      )
+                      for idx in range(max(len(main_entries), len(baseline_block))):
+                          gen = main_entries[idx] if idx < len(main_entries) else "<missing>"
+                          old = baseline_block[idx] if idx < len(baseline_block) else "<missing>"
+                          if gen != old:
+                              print("First differing index:", idx)
+                              print("GEN:", gen)
+                              print("OLD:", old)
+                              break
+                  else:
+                      print(f"Main extraction matches README block: {path} ({len(main_entries)} entries)")
+              else:
+                  print(
+                      f"Skipping main equivalence for {path}: "
+                      f"main_exists={main_entries is not None}, "
+                      f"baseline_exists={baseline_block is not None}"
+                  )
+
+          updated = {path: list(block) for path, block in groups.items()}
+          for path in changed_py:
+              new_entries = dev_blocks.get(path, [])
+              if new_entries:
+                  updated[path] = new_entries
+              else:
+                  updated.pop(path, None)
+
+          all_paths = sorted(updated)
+          new_block = []
+          for path in all_paths:
+              nums = []
+              for raw in updated[path]:
+                  m = entry_re.match(raw)
+                  assert m, f"generated bad entry: {raw!r}"
+                  assert m.group("path") == path, (path, raw)
+                  nums.append(int(m.group("line")))
+                  new_block.append(raw)
+              assert nums == sorted(nums), f"line numbers not sorted for {path}: {nums}"
+
+          new_lines = (
+              lines[:title_idx + 1]
+              + [""]
+              + new_block
+              + [""]
+              + lines[end_idx:]
+          )
+          new_text = "\n".join(new_lines)
+          if orig.endswith("\n"):
+              new_text += "\n"
+
+          Path("/tmp/README.updated.md").write_text(new_text, encoding="utf-8")
+          print(f"Updated README entries: {len(new_block)} across {len(all_paths)} paths")
+
+          diff = "".join(
+              difflib.unified_diff(
+                  orig.splitlines(keepends=True),
+                  new_text.splitlines(keepends=True),
+                  fromfile="a/README.md",
+                  tofile="b/README.md",
+                  n=3,
+              )
+          )
+          print("----- README DIFF START -----")
+          print(diff)
+          print("----- README DIFF END -----")
+
+          if validation_errors:
+              raise SystemExit(
+                  "Refusing to apply; formatter mismatch for: "
+                  + ", ".join(validation_errors)
+              )
+
+          apply = os.getenv("APPLY", "false").strip().lower() == "true"
+          if apply:
+              readme_path.write_text(new_text, encoding="utf-8")
+              print("APPLY=true: README.md updated in worktree")
+          else:
+              print("APPLY=false: dry run only; README.md not modified")
+          PY
+
+          if [ "${APPLY:-false}" = "true" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm -f .github/workflows/sync-todo-readme.yml >/dev/null
+            git add README.md
+            git commit -m "docs: update complete TODO list"
+            git push origin HEAD:dev
+          fi
